@@ -1,5 +1,12 @@
 {
   "name": "portfolio-worker-v1",
   "main": "worker.js",
-  "compatibility_date": "2026-06-30"
+  "compatibility_date": "2026-06-30",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "db_invplan",
+      "database_id": "cae42222-2d53-4781-acc3-3f401497a7c9"
+    }
+  ]
 }

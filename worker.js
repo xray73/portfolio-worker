@@ -1,19 +1,23 @@
 /**
  * PORTFOLIO COMMAND CENTER — Cloudflare Worker
- * Versione: 1.0 — Giugno 2026
+ * Versione: 1.1 — Giugno 2026
  * DB: db_invplan (D1)
  *
  * Routing:
- *   GET /macro      → t_macro_params completo
- *   GET /alert      → v_alert_attivi + contatori
- *   GET /ytd        → t_etf_riepilogo con contributo ponderato
- *   GET /capitale   → t_etf_riepilogo aggregato
- *   GET /portfolio  → v_portafoglio_corrente
- *   GET /scenario   → t_scenario_scores con probabilità
- *   GET /log        → t_log_azioni tipo=azione LIMIT 10
- *   GET /journal    → t_log_azioni tipo=journal LIMIT 5
- *   GET /report     → payload aggregato completo per PDF
- *   GET /health     → stato DB e timestamp
+ *   GET  /macro      → t_macro_params completo
+ *   GET  /alert      → v_alert_attivi + contatori
+ *   GET  /ytd        → t_etf_riepilogo con contributo ponderato
+ *   GET  /capitale   → t_etf_riepilogo aggregato
+ *   GET  /portfolio  → v_portafoglio_corrente
+ *   GET  /scenario   → t_scenario_scores con probabilità
+ *   GET  /log        → t_log_azioni tipo=azione LIMIT 10
+ *   GET  /journal    → t_log_azioni tipo=journal LIMIT 5
+ *   GET  /report     → payload aggregato completo per PDF
+ *   GET  /health     → stato DB e timestamp
+ *   POST /sync       → scrittura da Apps Script (richiede header X-Sync-Secret)
+ *
+ * SECRET: impostare SYNC_SECRET come variabile d'ambiente Worker
+ * (Settings → Variables and Secrets → Add → tipo Secret).
  */
 
 export default {
@@ -28,6 +32,113 @@ export default {
     };
 
     try {
+      // --------------------------------------------------
+      // POST /sync — scrittura da Apps Script
+      // --------------------------------------------------
+      if (path === '/sync' && request.method === 'POST') {
+        const secretHeader = request.headers.get('X-Sync-Secret');
+        if (!env.SYNC_SECRET || secretHeader !== env.SYNC_SECRET) {
+          return Response.json({ error: 'Non autorizzato' }, { status: 401, headers });
+        }
+
+        const body = await request.json();
+        const log = [];
+
+        // ── t_macro_params: replace completo ──────────────
+        if (body.macro_params && Array.isArray(body.macro_params)) {
+          await env.DB.prepare(`DELETE FROM t_macro_params`).run();
+          const stmts = body.macro_params.map(p =>
+            env.DB.prepare(
+              `INSERT INTO t_macro_params (nome, valore, stato, data_riferimento, note)
+               VALUES (?, ?, ?, ?, ?)`
+            ).bind(p.nome, p.valore, p.stato, p.data_riferimento, p.note || '')
+          );
+          if (stmts.length) await env.DB.batch(stmts);
+          log.push(`t_macro_params: ${stmts.length} righe`);
+        }
+
+        // ── t_scenario_scores: upsert ──────────────────────
+        if (body.scenario_scores && typeof body.scenario_scores === 'object') {
+          const entries = Object.entries(body.scenario_scores)
+            .filter(([k]) => ['base', 'stagflaz', 'recessivo', 'reflaz'].includes(k));
+          const stmts = entries.map(([scenario, score]) =>
+            env.DB.prepare(
+              `INSERT INTO t_scenario_scores (scenario, score, aggiornato_il)
+               VALUES (?, ?, datetime('now'))
+               ON CONFLICT(scenario) DO UPDATE SET score = excluded.score, aggiornato_il = datetime('now')`
+            ).bind(scenario, score)
+          );
+          if (stmts.length) await env.DB.batch(stmts);
+          log.push(`t_scenario_scores: ${stmts.length} righe`);
+        }
+
+        // ── t_etf_registry: replace completo ───────────────
+        if (body.etf_registry && Array.isArray(body.etf_registry)) {
+          await env.DB.prepare(`DELETE FROM t_etf_registry`).run();
+          const stmts = body.etf_registry.map(e =>
+            env.DB.prepare(
+              `INSERT INTO t_etf_registry (ticker, isin, nome, peso_target, categoria, borsa, valuta)
+               VALUES (?, ?, ?, ?, ?, ?, ?)`
+            ).bind(e.ticker, e.isin, e.nome, e.peso_target, e.categoria || '', e.borsa || '', e.valuta || 'EUR')
+          );
+          if (stmts.length) await env.DB.batch(stmts);
+          log.push(`t_etf_registry: ${stmts.length} righe`);
+        }
+
+        // ── t_etf_riepilogo: replace completo ──────────────
+        if (body.etf_riepilogo && Array.isArray(body.etf_riepilogo)) {
+          await env.DB.prepare(`DELETE FROM t_etf_riepilogo`).run();
+          const stmts = body.etf_riepilogo.map(e =>
+            env.DB.prepare(
+              `INSERT INTO t_etf_riepilogo (ticker, nome, peso, prezzo_attuale, prezzo_inizio_anno, ytd_pct)
+               VALUES (?, ?, ?, ?, ?, ?)`
+            ).bind(e.ticker, e.nome || '', e.peso || 0, e.prezzo_attuale || null, e.prezzo_inizio_anno || null, e.ytd_pct || null)
+          );
+          if (stmts.length) await env.DB.batch(stmts);
+          log.push(`t_etf_riepilogo: ${stmts.length} righe`);
+        }
+
+        // ── t_etf_prezzi: upsert incrementale (no delete) ──
+        if (body.etf_prezzi && Array.isArray(body.etf_prezzi)) {
+          const stmts = body.etf_prezzi.map(p =>
+            env.DB.prepare(
+              `INSERT INTO t_etf_prezzi (ticker, data, close)
+               VALUES (?, ?, ?)
+               ON CONFLICT(ticker, data) DO UPDATE SET close = excluded.close, aggiornato_il = datetime('now')`
+            ).bind(p.ticker, p.data, p.close)
+          );
+          // batch in chunk da 50 per evitare limiti
+          for (let i = 0; i < stmts.length; i += 50) {
+            await env.DB.batch(stmts.slice(i, i + 50));
+          }
+          log.push(`t_etf_prezzi: ${stmts.length} righe upsert`);
+        }
+
+        // ── t_log_azioni: insert solo nuove (basato su data+descrizione) ──
+        if (body.log_azioni && Array.isArray(body.log_azioni)) {
+          const stmts = body.log_azioni.map(l =>
+            env.DB.prepare(
+              `INSERT INTO t_log_azioni (tipo, data, ticker, descrizione, importo, note)
+               SELECT ?, ?, ?, ?, ?, ?
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM t_log_azioni WHERE tipo = ? AND data = ? AND descrizione = ?
+               )`
+            ).bind(
+              l.tipo || 'azione', l.data, l.ticker || '', l.descrizione || '', l.importo || null, l.note || '',
+              l.tipo || 'azione', l.data, l.descrizione || ''
+            )
+          );
+          if (stmts.length) await env.DB.batch(stmts);
+          log.push(`t_log_azioni: ${stmts.length} righe processate`);
+        }
+
+        return Response.json({
+          status: 'ok',
+          synced_at: new Date().toISOString(),
+          log,
+        }, { headers });
+      }
+
       switch (path) {
 
         // --------------------------------------------------
